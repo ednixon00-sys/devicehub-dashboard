@@ -1,31 +1,15 @@
-// server.js — Read-only Dashboard (separate URL)
-// Shows Installed / Active / Offline / Deleted with 5s auto-refresh
-// PROXIES to your main app's /stats?token=... so your secret never hits the browser.
+// server.js — Read-only dashboard with NO external deps
+// Requires env vars: API_BASE, STATS_TOKEN
+// URL: https://lobster-app-krgqy.ondigitalocean.app/
 
-const express = require("express");
+const http = require("http");
+const { URL } = require("url");
 
 const PORT = process.env.PORT || 8080;
-
-// Point this to your MAIN app (the one that has /stats?token=...)
-// Example: https://seashell-app-naq42.ondigitalocean.app
 const API_BASE = process.env.API_BASE || "";
-
-// MUST match STATS_TOKEN configured in your MAIN app
 const STATS_TOKEN = process.env.STATS_TOKEN || "";
 
-if (!API_BASE) {
-  console.warn("[dashboard] API_BASE env is empty. Set it to your main app URL.");
-}
-if (!STATS_TOKEN) {
-  console.warn("[dashboard] STATS_TOKEN env is empty. Set it to the same token used by your main app.");
-}
-
-const app = express();
-
-// Tiny HTML dashboard at /
-app.get("/", (_req, res) => {
-  res.setHeader("Cache-Control", "no-store");
-  res.status(200).send(`<!doctype html>
+const html = `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8"/>
@@ -41,7 +25,6 @@ app.get("/", (_req, res) => {
   .num{font-size:36px;font-weight:700;margin-top:8px}
   .muted{color:#9fb2c8;font-size:13px}
   .topbar{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px}
-  .link{color:#93c5fd;text-decoration:none}
   .err{color:#ef4444}
 </style>
 </head>
@@ -54,24 +37,11 @@ app.get("/", (_req, res) => {
   <div id="error" class="err" style="display:none"></div>
 
   <div class="grid">
-    <div class="card">
-      <div class="muted">Installed (ever seen)</div>
-      <div id="installed" class="num">—</div>
-    </div>
-    <div class="card">
-      <div class="muted">Active (online)</div>
-      <div id="active" class="num">—</div>
-    </div>
-    <div class="card">
-      <div class="muted">Offline</div>
-      <div id="offline" class="num">—</div>
-    </div>
-    <div class="card">
-      <div class="muted">Deleted</div>
-      <div id="deleted" class="num">—</div>
-    </div>
+    <div class="card"><div class="muted">Installed (ever seen)</div><div id="installed" class="num">—</div></div>
+    <div class="card"><div class="muted">Active (online)</div><div id="active" class="num">—</div></div>
+    <div class="card"><div class="muted">Offline</div><div id="offline" class="num">—</div></div>
+    <div class="card"><div class="muted">Deleted</div><div id="deleted" class="num">—</div></div>
   </div>
-
   <div class="card" style="margin-top:16px">
     <div class="muted">Last Updated</div>
     <div id="updated" style="margin-top:4px">—</div>
@@ -83,7 +53,7 @@ async function load(){
     const r = await fetch('/stats');
     const j = await r.json();
     if(!r.ok){ throw new Error(j && j.error || r.status); }
-    const $ = (id)=>document.getElementById(id);
+    const $ = id => document.getElementById(id);
     $('installed').textContent = j.installed ?? '0';
     $('active').textContent    = j.active ?? '0';
     $('offline').textContent   = j.offline ?? '0';
@@ -102,28 +72,42 @@ load();
 setInterval(load, 5000);
 </script>
 </body>
-</html>`);
-});
+</html>`;
 
-// Server-side proxy so the browser never sees your secret token
-app.get("/stats", async (_req, res) => {
-  try {
-    if (!API_BASE || !STATS_TOKEN) {
-      return res.status(500).json({ error: "dashboard_not_configured" });
+function send(res, status, body, headers = {}) {
+  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", ...headers });
+  res.end(body);
+}
+function sendJSON(res, status, obj) {
+  res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+  res.end(JSON.stringify(obj));
+}
+
+const server = http.createServer(async (req, res) => {
+  try{
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.pathname === "/") return send(res, 200, html);
+    if (url.pathname === "/healthz") return send(res, 200, "OK", { "Content-Type": "text/plain" });
+
+    if (url.pathname === "/stats") {
+      if (!API_BASE || !STATS_TOKEN) {
+        return sendJSON(res, 500, { error: "dashboard_not_configured" });
+      }
+      const apiUrl = API_BASE.replace(/\/$/, "") + "/stats?token=" + encodeURIComponent(STATS_TOKEN);
+      try {
+        const r = await fetch(apiUrl, { headers: { "Accept": "application/json" } });
+        const j = await r.json();
+        res.writeHead(r.status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        return res.end(JSON.stringify(j));
+      } catch (e) {
+        return sendJSON(res, 500, { error: "dashboard_fetch_failed", detail: String(e) });
+      }
     }
-    const url = `${API_BASE.replace(/\\/$/,'')}/stats?token=${encodeURIComponent(STATS_TOKEN)}`;
-    const r = await fetch(url, { headers: { "Accept": "application/json" } });
-    const j = await r.json();
-    res.setHeader("Cache-Control", "no-store");
-    res.status(r.status).json(j);
-  } catch (e) {
-    res.status(500).json({ error: "dashboard_fetch_failed", detail: String(e) });
+
+    send(res, 404, "Not found", { "Content-Type": "text/plain" });
+  }catch(err){
+    sendJSON(res, 500, { error: "server_error", detail: String(err) });
   }
 });
 
-// Health
-app.get("/healthz", (_req, res) => res.send("OK"));
-
-app.listen(PORT, () => {
-  console.log("Dashboard listening on :" + PORT);
-});
+server.listen(PORT, () => console.log("Dashboard listening on :" + PORT));
