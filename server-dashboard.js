@@ -3,7 +3,7 @@ import fetch from "node-fetch";
 
 const PORT = process.env.PORT || 8080;
 // Point this at your existing app (keep https)
-const API_BASE = process.env.API_BASE || "https://seashell-app-naq42.ondigitalocean.app";
+const API_BASE = process.env.API_BASE || "https://lobster-app-krgqy.ondigitalocean.app";
 // This token must match STATS_TOKEN in the main app
 const STATS_TOKEN = process.env.STATS_TOKEN;
 
