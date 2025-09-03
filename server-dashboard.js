@@ -2,7 +2,7 @@
 // - Pulls summary from seashell /stats (token-protected)
 // - Pulls device list from seashell /api/devices using ADMIN_TOKEN (server-side only)
 // - Geo-resolves device IPs (IPv4 and IPv6) via ipapi.co (cached in-memory)
-// - Hides IP addresses from UI; shows Country ONLY (city removed)
+// - Hides IP addresses from UI; shows Country and City
 // - Serves live dashboard at "/" and JSON at "/data"
 
 import express from "express";
@@ -32,30 +32,34 @@ const app = express();
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 
 // --- In-memory cache for Geo lookups to avoid rate limits
-// ip -> { country, latitude, longitude, ts }
+// ip -> { city, country, latitude, longitude, ts }
 const geoCache = new Map();
 
 // Normalize IP string: trim, peel first item, strip ::ffff: prefix, drop obvious locals
 function normalizeIp(ip) {
   if (!ip) return null;
   let s = String(ip).trim();
-  if (s.includes(",")) s = s.split(",")[0].trim();           // first in potential list
-  const m = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);   // IPv4-mapped IPv6
+  // If somehow a comma list sneaks in, take first
+  if (s.includes(",")) s = s.split(",")[0].trim();
+  // Map IPv6-embedded IPv4 to plain IPv4
+  const m = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
   if (m) s = m[1];
-  if (s === "::1" || s === "127.0.0.1") return null;          // loopbacks
+  // Filter loopbacks/local
+  if (s === "::1" || s === "127.0.0.1") return null;
   return s;
 }
 
 // Lookup IP via ipapi.co (supports IPv4 & IPv6)
-// Returns { country } (city intentionally omitted)
+// Returns { city, country, latitude, longitude } or null
 async function lookupGeo(rawIp) {
   const ip = normalizeIp(rawIp);
   if (!ip) return null;
 
+  // cache hit (1 week TTL)
   const cached = geoCache.get(ip);
   if (cached && Date.now() - cached.ts < 7 * 24 * 3600 * 1000) {
-    const { country } = cached;
-    return { country };
+    const { city, country, latitude, longitude } = cached;
+    return { city, country, latitude, longitude };
   }
 
   try {
@@ -63,8 +67,10 @@ async function lookupGeo(rawIp) {
     if (!r.ok) return null;
     const j = await r.json();
     const geo = {
+      city: j.city || "",
       country: j.country_name || j.country || "",
-      // keep lat/lon out of payload; not used in UI now
+      latitude: typeof j.latitude === "number" ? j.latitude : (j.latitude ? Number(j.latitude) : null),
+      longitude: typeof j.longitude === "number" ? j.longitude : (j.longitude ? Number(j.longitude) : null),
     };
     geoCache.set(ip, { ...geo, ts: Date.now() });
     return geo;
@@ -94,8 +100,8 @@ async function fetchDevices() {
 }
 
 // GET /data → JSON used by dashboard (polled by client)
-// Result: { ts, installed, active, offline, deleted, devices: [{id, country, os, username, hostname, lastSeen, online}] }
-// NOTE: IPs and city are intentionally omitted for privacy.
+// Result: { ts, installed, active, offline, deleted, devices: [{id, country, city, os, username, hostname, lastSeen, online}] }
+// NOTE: IPs are intentionally omitted for privacy.
 app.get("/data", async (_req, res) => {
   try {
     const [stats, devices] = await Promise.all([
@@ -118,6 +124,7 @@ app.get("/data", async (_req, res) => {
     const publicDevices = devices.map(d => ({
       id: d.id || "",
       country: d.geo?.country || "",
+      city: d.geo?.city || "",
       os: d.os || "",
       username: d.username || "",
       hostname: d.hostname || "",
@@ -139,7 +146,7 @@ app.get("/data", async (_req, res) => {
   }
 });
 
-// --- UI: live dashboard (no admin links, no IPs, no city)
+// --- UI: live dashboard (no admin links, no IPs shown)
 app.get("/", (_req, res) => {
   res.status(200).send(`<!doctype html>
 <html>
@@ -184,7 +191,7 @@ app.get("/", (_req, res) => {
       <canvas id="spark" width="600" height="100"></canvas>
     </div>
     <div class="card" style="flex:1 1 420px">
-      <div class="caps">Top Locations (by country)</div>
+      <div class="caps">Top Locations (by city/country)</div>
       <div id="locs" class="muted">No data yet</div>
     </div>
   </div>
@@ -196,6 +203,7 @@ app.get("/", (_req, res) => {
         <tr>
           <th>Device ID</th>
           <th>Country</th>
+          <th>City</th>
           <th>OS</th>
           <th>Username</th>
           <th>Hostname</th>
@@ -241,8 +249,8 @@ function drawSpark(){
 function groupLocations(devices){
   const map = new Map();
   for(const d of devices){
-    const key = (d.country || '').trim();
-    if(!key) continue;
+    const key = (d.city ? d.city + ', ' : '') + (d.country || '');
+    if(!key.trim()) continue;
     map.set(key, (map.get(key)||0)+1);
   }
   const arr = [...map.entries()].sort((a,b)=>b[1]-a[1]).slice(0,8);
@@ -270,16 +278,17 @@ async function pull(){
   if(hist.length > MAX_POINTS) hist.shift();
   drawSpark();
 
-  // locations (country only)
+  // locations
   document.getElementById('locs').innerHTML = groupLocations(j.devices||[]);
 
-  // table (no IPs, no city)
+  // table (no IPs)
   const rows = (j.devices||[]).map(d => {
     const status = d.online ? '<span class="ok">ONLINE</span>' : '<span class="bad">OFFLINE</span>';
     return \`
       <tr>
         <td>\${d.id}</td>
         <td>\${d.country}</td>
+        <td>\${d.city}</td>
         <td>\${d.os}</td>
         <td>\${d.username}</td>
         <td>\${d.hostname}</td>
@@ -287,7 +296,7 @@ async function pull(){
         <td>\${fmt(d.lastSeen)}</td>
       </tr>\`;
   }).join('');
-  document.getElementById('tbody').innerHTML = rows || '<tr><td colspan="7" class="muted">No devices</td></tr>';
+  document.getElementById('tbody').innerHTML = rows || '<tr><td colspan="8" class="muted">No devices</td></tr>';
 }
 
 setInterval(pull, 5000);
