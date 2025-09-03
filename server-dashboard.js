@@ -1,9 +1,9 @@
 // Lobster Dashboard server (no links to admin UI)
 // - Pulls summary from seashell /stats (token-protected)
-// - Optionally pulls device list from seashell /api/devices using ADMIN_TOKEN (server-side only)
-// - Geo-resolves device IPs via ipapi.co (cached in-memory)
-// - Hides IP addresses from the UI/JSON; adds a Country column
-// - Serves a live dashboard at "/" and JSON at "/data"
+// - Pulls device list from seashell /api/devices using ADMIN_TOKEN (server-side only)
+// - Geo-resolves device IPs (IPv4 and IPv6) via ipapi.co (cached in-memory)
+// - Hides IP addresses from UI; shows Country and City
+// - Serves live dashboard at "/" and JSON at "/data"
 
 import express from "express";
 
@@ -15,13 +15,15 @@ const API_BASE = (process.env.API_BASE || "").replace(/\/+$/, "");
 // Required: token protecting /stats on seashell
 const STATS_TOKEN = (process.env.STATS_TOKEN || "").trim();
 
-// Optional: ADMIN_TOKEN to read /api/devices (server-side only, never sent to browser)
+// Required for device list (to get IPs server-side for geo)
 const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || "").trim();
 
 if (!API_BASE || !STATS_TOKEN) {
   console.error("ERROR: Missing API_BASE and/or STATS_TOKEN env vars.");
-  console.error("Set API_BASE=https://seashell-app-... and STATS_TOKEN=...");
   process.exit(1);
+}
+if (!ADMIN_TOKEN) {
+  console.warn("[dashboard] ADMIN_TOKEN not set — device list and geo will be empty.");
 }
 
 const app = express();
@@ -33,25 +35,37 @@ app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 // ip -> { city, country, latitude, longitude, ts }
 const geoCache = new Map();
 
-// Simple IPv4 regex
-const ipv4 = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+// Normalize IP string: trim, peel first item, strip ::ffff: prefix, drop obvious locals
+function normalizeIp(ip) {
+  if (!ip) return null;
+  let s = String(ip).trim();
+  // If somehow a comma list sneaks in, take first
+  if (s.includes(",")) s = s.split(",")[0].trim();
+  // Map IPv6-embedded IPv4 to plain IPv4
+  const m = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
+  if (m) s = m[1];
+  // Filter loopbacks/local
+  if (s === "::1" || s === "127.0.0.1") return null;
+  return s;
+}
 
-// Lookup IP via ipapi.co (no key; subject to rate limit)
+// Lookup IP via ipapi.co (supports IPv4 & IPv6)
 // Returns { city, country, latitude, longitude } or null
-async function lookupGeo(ip) {
+async function lookupGeo(rawIp) {
+  const ip = normalizeIp(rawIp);
+  if (!ip) return null;
+
+  // cache hit (1 week TTL)
+  const cached = geoCache.get(ip);
+  if (cached && Date.now() - cached.ts < 7 * 24 * 3600 * 1000) {
+    const { city, country, latitude, longitude } = cached;
+    return { city, country, latitude, longitude };
+  }
+
   try {
-    if (!ipv4.test(ip)) return null; // skip IPv6 / non-IPv4 for now
-
-    // cached?
-    const cached = geoCache.get(ip);
-    if (cached && Date.now() - cached.ts < 7 * 24 * 3600 * 1000) {
-      return { city: cached.city, country: cached.country, latitude: cached.latitude, longitude: cached.longitude };
-    }
-
     const r = await fetch(`https://ipapi.co/${ip}/json/`, { timeout: 6000 });
     if (!r.ok) return null;
     const j = await r.json();
-
     const geo = {
       city: j.city || "",
       country: j.country_name || j.country || "",
@@ -73,7 +87,7 @@ async function fetchStats() {
   return r.json();
 }
 
-// Optionally pull devices from /api/devices (server-side; secures ADMIN_TOKEN)
+// Pull devices from /api/devices (server-side; secures ADMIN_TOKEN)
 async function fetchDevices() {
   if (!ADMIN_TOKEN) return [];
   const r = await fetch(`${API_BASE}/api/devices`, {
@@ -87,7 +101,7 @@ async function fetchDevices() {
 
 // GET /data → JSON used by dashboard (polled by client)
 // Result: { ts, installed, active, offline, deleted, devices: [{id, country, city, os, username, hostname, lastSeen, online}] }
-// NOTE: IPs are intentionally omitted from the response for privacy.
+// NOTE: IPs are intentionally omitted for privacy.
 app.get("/data", async (_req, res) => {
   try {
     const [stats, devices] = await Promise.all([
@@ -95,21 +109,20 @@ app.get("/data", async (_req, res) => {
       fetchDevices().catch(() => []),
     ]);
 
-    // Enrich devices with geo (server-side) to keep tokens private.
-    // Resolve up to 10 IPs per request to avoid external API rate limits.
-    const geoTargets = devices
-      .filter(d => d?.ip && ipv4.test(d.ip))
-      .slice(0, 10);
+    // Resolve up to 15 IPs per request (tweak if you like)
+    const toResolve = devices
+      .filter(d => d?.ip)
+      .slice(0, 15);
 
-    await Promise.all(geoTargets.map(async (d) => {
-      const geo = await lookupGeo(d.ip);
-      d.geo = geo || null;
-    }));
+    await Promise.all(
+      toResolve.map(async (d) => {
+        const geo = await lookupGeo(d.ip);
+        d.geo = geo || null;
+      })
+    );
 
-    // Strip IP before sending to the browser; include country/city only.
     const publicDevices = devices.map(d => ({
       id: d.id || "",
-      // Do NOT expose IP:
       country: d.geo?.country || "",
       city: d.geo?.city || "",
       os: d.os || "",
