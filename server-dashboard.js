@@ -58,8 +58,8 @@ async function lookupGeo(rawIp) {
   // cache hit (1 week TTL)
   const cached = geoCache.get(ip);
   if (cached && Date.now() - cached.ts < 7 * 24 * 3600 * 1000) {
-    const { city, country, latitude, longitude } = cached;
-    return { city, country, latitude, longitude };
+    const { country, latitude, longitude } = cached;
+    return { country, latitude, longitude };
   }
 
   try {
