@@ -1,7 +1,8 @@
 // Lobster Dashboard server (no links to admin UI)
 // - Pulls summary from seashell /stats (token-protected)
-// - (Optional) Pulls device list from seashell /api/devices using ADMIN_TOKEN (server-side only)
+// - Optionally pulls device list from seashell /api/devices using ADMIN_TOKEN (server-side only)
 // - Geo-resolves device IPs via ipapi.co (cached in-memory)
+// - Hides IP addresses from the UI/JSON; adds a Country column
 // - Serves a live dashboard at "/" and JSON at "/data"
 
 import express from "express";
@@ -26,7 +27,7 @@ if (!API_BASE || !STATS_TOKEN) {
 const app = express();
 
 // --- Health check
-app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 
 // --- In-memory cache for Geo lookups to avoid rate limits
 // ip -> { city, country, latitude, longitude, ts }
@@ -39,7 +40,7 @@ const ipv4 = /^(?:\d{1,3}\.){3}\d{1,3}$/;
 // Returns { city, country, latitude, longitude } or null
 async function lookupGeo(ip) {
   try {
-    if (!ipv4.test(ip)) return null; // skip IPv6 or private formats for now
+    if (!ipv4.test(ip)) return null; // skip IPv6 / non-IPv4 for now
 
     // cached?
     const cached = geoCache.get(ip);
@@ -85,7 +86,8 @@ async function fetchDevices() {
 }
 
 // GET /data → JSON used by dashboard (polled by client)
-// Result: { ts, installed, active, offline, deleted, devices: [{id, ip,..., geo}] }
+// Result: { ts, installed, active, offline, deleted, devices: [{id, country, city, os, username, hostname, lastSeen, online}] }
+// NOTE: IPs are intentionally omitted from the response for privacy.
 app.get("/data", async (_req, res) => {
   try {
     const [stats, devices] = await Promise.all([
@@ -93,16 +95,28 @@ app.get("/data", async (_req, res) => {
       fetchDevices().catch(() => []),
     ]);
 
-    // Enrich devices with geo (server-side) to keep tokens private
-    // Resolve up to 10 IPs per request to avoid external API rate limits
+    // Enrich devices with geo (server-side) to keep tokens private.
+    // Resolve up to 10 IPs per request to avoid external API rate limits.
     const geoTargets = devices
       .filter(d => d?.ip && ipv4.test(d.ip))
       .slice(0, 10);
 
     await Promise.all(geoTargets.map(async (d) => {
-      if (!d.ip) return;
       const geo = await lookupGeo(d.ip);
       d.geo = geo || null;
+    }));
+
+    // Strip IP before sending to the browser; include country/city only.
+    const publicDevices = devices.map(d => ({
+      id: d.id || "",
+      // Do NOT expose IP:
+      country: d.geo?.country || "",
+      city: d.geo?.city || "",
+      os: d.os || "",
+      username: d.username || "",
+      hostname: d.hostname || "",
+      lastSeen: d.lastSeen || 0,
+      online: !!d.online,
     }));
 
     res.json({
@@ -111,16 +125,7 @@ app.get("/data", async (_req, res) => {
       active: stats?.active ?? null,
       offline: stats?.offline ?? null,
       deleted: stats?.deleted ?? null,
-      devices: devices.map(d => ({
-        id: d.id || "",
-        ip: d.ip || "",
-        username: d.username || "",
-        hostname: d.hostname || "",
-        os: d.os || "",
-        lastSeen: d.lastSeen || 0,
-        online: !!d.online,
-        geo: d.geo || null,
-      })),
+      devices: publicDevices,
     });
   } catch (e) {
     console.error("ERROR /data:", e.message);
@@ -128,7 +133,7 @@ app.get("/data", async (_req, res) => {
   }
 });
 
-// --- UI: live dashboard (no admin links)
+// --- UI: live dashboard (no admin links, no IPs shown)
 app.get("/", (_req, res) => {
   res.status(200).send(`<!doctype html>
 <html>
@@ -183,7 +188,14 @@ app.get("/", (_req, res) => {
     <table>
       <thead>
         <tr>
-          <th>Device ID</th><th>IP</th><th>Location</th><th>OS</th><th>Username</th><th>Hostname</th><th>Status</th><th>Last Seen</th>
+          <th>Device ID</th>
+          <th>Country</th>
+          <th>City</th>
+          <th>OS</th>
+          <th>Username</th>
+          <th>Hostname</th>
+          <th>Status</th>
+          <th>Last Seen</th>
         </tr>
       </thead>
       <tbody id="tbody"></tbody>
@@ -224,9 +236,8 @@ function drawSpark(){
 function groupLocations(devices){
   const map = new Map();
   for(const d of devices){
-    const g = d.geo;
-    if(!g || !g.city && !g.country) continue;
-    const key = (g.city? g.city+', ' : '') + (g.country||'');
+    const key = (d.city ? d.city + ', ' : '') + (d.country || '');
+    if(!key.trim()) continue;
     map.set(key, (map.get(key)||0)+1);
   }
   const arr = [...map.entries()].sort((a,b)=>b[1]-a[1]).slice(0,8);
@@ -257,15 +268,14 @@ async function pull(){
   // locations
   document.getElementById('locs').innerHTML = groupLocations(j.devices||[]);
 
-  // table
+  // table (no IPs)
   const rows = (j.devices||[]).map(d => {
-    const loc = d.geo ? ((d.geo.city? d.geo.city + ', ' : '') + (d.geo.country||'')) : '';
     const status = d.online ? '<span class="ok">ONLINE</span>' : '<span class="bad">OFFLINE</span>';
     return \`
       <tr>
         <td>\${d.id}</td>
-        <td>\${d.ip}</td>
-        <td>\${loc}</td>
+        <td>\${d.country}</td>
+        <td>\${d.city}</td>
         <td>\${d.os}</td>
         <td>\${d.username}</td>
         <td>\${d.hostname}</td>
